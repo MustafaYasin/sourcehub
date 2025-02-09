@@ -1,203 +1,300 @@
+import os
+from pathlib import Path
+from typing import Any, Sequence
+
 import streamlit as st
-from openai import OpenAIError
-from langchain.vectorstores import Chroma
-from langchain.embeddings import OpenAIEmbeddings
+from openai import OpenAI
+from sqlmodel import select
+from langchain.document_loaders import UnstructuredFileLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import tiktoken
+import uuid
+
+from database import open_session
+from database.models import Chunk
+
+# Configuration
+OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
+OPENAI_CHAT_MODEL = "gpt-4-mini"
+EMBEDDING_DIMENSIONS = 1536
 
 
-# loading unstructured files of all sorts as LangChain Documents
-def load_document(file):
-    from langchain.document_loaders import UnstructuredFileLoader
-    loader = UnstructuredFileLoader(file)
-    data = loader.load()
-    return data
+def load_document(file_path: str | Path) -> Sequence[dict[str, Any]]:
+    """Load a document using LangChain's UnstructuredFileLoader."""
+    loader = UnstructuredFileLoader(str(file_path))
+    return loader.load()
 
 
-# splitting data in chunks
-def chunk_data(data, chunk_size=256, chunk_overlap=20):
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    chunks = text_splitter.split_documents(data)
-    return chunks
+def create_chunks(
+        documents: Sequence[dict[str, Any]],
+        chunk_size: int = 512,
+        chunk_overlap: int = 20
+) -> Sequence[dict[str, Any]]:
+    """Split documents into chunks using RecursiveCharacterTextSplitter."""
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap
+    )
+    return splitter.split_documents(documents)
 
 
-# create embeddings using OpenAIEmbeddings() and save them in a Chroma vector store
-def create_embeddings(chunks):
-    embeddings = OpenAIEmbeddings()
-    vector_store = Chroma.from_documents(chunks, embeddings)
-    return vector_store
+def store_document_chunks(
+        chunks: Sequence[dict[str, Any]],
+        title: str,
+        chunk_size: int,
+        chunk_overlap: int
+) -> None:
+    """Store document chunks in the database."""
+    with open_session() as session:
+        for i, chunk in enumerate(chunks):
+            db_chunk = Chunk(
+                id=uuid.uuid4(),
+                chunk_content=chunk.page_content,
+                chunk_title=title,
+                page_number=i,
+                meta={
+                    **chunk.metadata,
+                    "chunk_size": chunk_size,
+                    "chunk_overlap": chunk_overlap
+                }
+            )
+            session.add(db_chunk)
+        session.commit()
 
 
-def ask_and_get_answer(vector_store, q, k=3):
-    from langchain.chains import RetrievalQA
-    from langchain.chat_models import ChatOpenAI
-
-    llm = ChatOpenAI(model='gpt-4o-mini', temperature=0)
-    retriever = vector_store.as_retriever(search_type='similarity', search_kwargs={'k': k})
-    chain = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever)
-
-    answer = chain.run(q)
-    return answer
+def create_embedding(text: str, client: OpenAI) -> list[float]:
+    """Create an embedding for a single text using OpenAI's API."""
+    response = client.embeddings.create(
+        model=OPENAI_EMBEDDING_MODEL,
+        input=text,
+        encoding_format="float"
+    )
+    return response.data[0].embedding
 
 
-# calculate embedding cost using tiktoken
-def calculate_embedding_cost(texts):
-    import tiktoken
-    enc = tiktoken.encoding_for_model('text-embedding-3-small')
-    total_tokens = sum([len(enc.encode(page.page_content)) for page in texts])
-    return total_tokens, total_tokens / 1000 * 0.0004
+def process_pending_embeddings(client: OpenAI) -> int:
+    """Create embeddings for all chunks that don't have them yet."""
+    processed_count = 0
+
+    with open_session() as session:
+        chunks = session.exec(
+            select(Chunk).where(Chunk.is_embedded == False)  # noqa: E712
+        ).all()
+
+        for chunk in chunks:
+            chunk.embedding = create_embedding(chunk.chunk_content, client)
+            chunk.is_embedded = True
+            processed_count += 1
+
+        session.commit()
+
+    return processed_count
 
 
-def check_openai_api_key_exist():
-    if 'OPENAI_API_KEY' not in os.environ:
-        st.error('Please provide your OpenAI API key in the sidebar.')
-        st.stop()
+def find_relevant_chunks(
+        query: str,
+        client: OpenAI,
+        k: int = 3
+) -> Sequence[Chunk]:
+    """Find the k most relevant chunks using vector similarity."""
+    query_embedding = create_embedding(query, client)
+
+    with open_session() as session:
+        chunks = session.exec(
+            select(Chunk)
+            .where(Chunk.is_embedded == True)  # noqa: E712
+            .order_by(Chunk.embedding.l2_distance(query_embedding))
+            .limit(k)
+        ).all()
+
+        return chunks
 
 
-def is_api_key_valid(api_key):
-    import openai
-    openai.api_key = api_key
+def generate_answer(
+        query: str,
+        client: OpenAI,
+        k: int = 3
+) -> str:
+    """Generate an answer for a query using relevant chunks and GPT-4."""
+    relevant_chunks = find_relevant_chunks(query, client, k)
+
+    if not relevant_chunks:
+        return "No relevant information found in the documents."
+
+    # Prepare context from chunks
+    context = "\n\n".join(
+        f"[From {chunk.chunk_title}, Page {chunk.page_number + 1}]:\n{chunk.chunk_content}"
+        for chunk in relevant_chunks
+    )
+
+    # Create prompt
+    prompt = f"""Based on the following excerpts from documents, please answer the question.
+    If the answer cannot be found in the excerpts, say "I cannot find relevant information to answer this question."
+
+    Document Excerpts:
+    {context}
+
+    Question: {query}
+
+    Answer: """
+
+    # Get GPT-4 response
+    response = client.chat.completions.create(
+        model=OPENAI_CHAT_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
+    return response.choices[0].message.content
+
+
+def calculate_embedding_cost(texts: Sequence[dict[str, Any]]) -> tuple[int, float]:
+    """Calculate the cost of creating embeddings."""
+    enc = tiktoken.encoding_for_model(OPENAI_EMBEDDING_MODEL)
+    total_tokens = sum(len(enc.encode(text.page_content)) for text in texts)
+    # Current pricing for text-embedding-3-small is $0.0004 per 1K tokens
+    cost = (total_tokens / 1000) * 0.0004
+    return total_tokens, cost
+
+
+def process_documents(
+        uploaded_files: Sequence[Any],
+        chunk_size: int,
+        chunk_overlap: int,
+        client: OpenAI
+) -> None:
+    """Process uploaded documents and store them in the database."""
+    temp_dir = Path('./temp_docs')
+    temp_dir.mkdir(exist_ok=True)
+
     try:
-        openai.Model.list()
-    except openai.error.AuthenticationError as e:
-        return False
+        all_chunks = []
+        for uploaded_file in uploaded_files:
+            # Save file temporarily
+            temp_path = temp_dir / uploaded_file.name
+            temp_path.write_bytes(uploaded_file.read())
+
+            # Process document
+            documents = load_document(temp_path)
+            chunks = create_chunks(documents, chunk_size, chunk_overlap)
+            all_chunks.extend(chunks)
+
+            # Store in database
+            store_document_chunks(chunks, uploaded_file.name, chunk_size, chunk_overlap)
+
+            st.sidebar.write(f'Processed: {uploaded_file.name} ({len(chunks)} chunks)')
+
+        # Calculate and display embedding cost
+        tokens, cost = calculate_embedding_cost(all_chunks)
+        st.sidebar.write(f'Embedding cost: ${cost:.4f} ({tokens:,} tokens)')
+
+        # Create embeddings
+        with st.sidebar.spinner('Creating embeddings...'):
+            processed_count = process_pending_embeddings(client)
+            st.sidebar.success(f'Created {processed_count} embeddings')
+
+    finally:
+        # Cleanup temporary files
+        for file in temp_dir.iterdir():
+            file.unlink()
+        temp_dir.rmdir()
+
+
+def main() -> None:
+    """Main application entry point."""
+    # Initialize Streamlit page
+    st.set_page_config(
+        page_title="Document Q&A System",
+        page_icon="📚",
+        layout="wide"
+    )
+    st.header("Document Question-Answering System")
+
+    # Initialize session state
+    if 'text_input' not in st.session_state:
+        st.session_state.text_input = ''
+
+    # Setup sidebar
+    with st.sidebar:
+        api_key = st.text_input('OpenAI API Key:', type='password')
+        if api_key:
+            os.environ['OPENAI_API_KEY'] = api_key
+            client = OpenAI()
+        else:
+            client = None
+
+        uploaded_files = st.file_uploader(
+            'Upload documents to analyze:',
+            accept_multiple_files=True
+        )
+
+        chunk_size = st.number_input(
+            'Chunk size:',
+            min_value=100,
+            max_value=8192,
+            value=512,
+            help="Number of characters per chunk. Larger chunks provide more context but cost more to embed."
+        )
+
+        chunk_overlap = st.number_input(
+            'Chunk overlap:',
+            min_value=0,
+            max_value=chunk_size // 2,
+            value=20,
+            help="Number of characters that overlap between chunks to maintain context."
+        )
+
+        k = st.number_input(
+            'Number of relevant chunks:',
+            min_value=1,
+            max_value=20,
+            value=3,
+            help="Number of most relevant chunks to use when answering questions."
+        )
+
+    # Handle document processing
+    if uploaded_files and st.sidebar.button('Process Documents'):
+        if not client:
+            st.sidebar.error('Please provide your OpenAI API key.')
+            st.stop()
+
+        with st.spinner('Processing documents...'):
+            process_documents(uploaded_files, chunk_size, chunk_overlap, client)
+
+    # Setup query interface
+    query = st.text_input('Ask a question about your documents:', key='text_input')
+
+    if query:
+        if not client:
+            st.error('Please provide your OpenAI API key to ask questions.')
+            st.stop()
+
+        with st.spinner('Finding answer...'):
+            answer = generate_answer(query, client, k)
+            st.text_area('Answer:', value=answer, height=200)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button('New Question'):
+                st.session_state.text_input = ''
+                st.experimental_rerun()
     else:
-        return True
+        st.info('Upload documents and ask questions to get started.')
 
+    # Add system information
+    st.markdown('---')
+    st.subheader('About this System')
+    st.markdown("""
+    This document Q&A system uses advanced natural language processing to help you interact with your documents:
 
-def clear_text_input():
-    st.session_state.text_input = ''
+    1. Documents are split into manageable chunks and stored in a PostgreSQL database
+    2. Each chunk is embedded using OpenAI's text-embedding-3-small model
+    3. Questions are matched to relevant document chunks using vector similarity
+    4. GPT-4 generates answers based on the most relevant chunks
 
-
-def start_over_with_new_document():
-    st.session_state.text_input = ''
-    # delete the vector store from the session state
-    del st.session_state.vs
-    # display message to user
-    st.info('Please upload new documents to continue after clearing or updating the current ones.')
+    The system uses pgvector for efficient similarity search and can handle multiple document formats.
+    """)
 
 
 if __name__ == "__main__":
-    import os
-    
-    # two images in sidebar next to each other
-    col1, col2 = st.sidebar.columns(2)
-    col1.image('images/OpenAI_logo.png')
-    col2.image('images/langchain-chroma-light.png')
-
-    st.header('LLM Question-Answering Application')
-    with st.sidebar:
-        # text_input for the OpenAI API key
-        api_key = st.text_input('Your OpenAI API Key:', type='password')
-        if api_key:
-            os.environ['OPENAI_API_KEY'] = api_key
-
-        # check if the API key is not valid
-        if api_key and not is_api_key_valid(api_key):
-            st.error('Invalid OpenAI API key. Please provide a valid key.')
-            st.stop()
-
-
-        # file uploader widget
-        uploaded_files = st.file_uploader('Upload any file format with text to analyze:', accept_multiple_files=True)
-
-        # chunk size number widget
-        chunk_size = st.number_input('Chunk size:', min_value=100, max_value=8192, value=512)
-
-        # k number input widget
-        k = st.number_input('k', min_value=1, max_value=20, value=3)
-
-        # initialize add_data
-        add_data = False
-
-        # add data button widget
-        if is_api_key_valid(api_key):
-            add_data = st.button('Add Data', key='add_data')
-        else:
-            st.info('No OpenAI API key. Please provide a valid key.')
-
-        if uploaded_files and add_data: # if the user uploaded files and clicked the add data button
-            check_openai_api_key_exist()
-            with st.spinner('Reading, chunking and embedding data ...'):
-
-                # create ./docs/ folder if it doesn't exist
-                if not os.path.exists('./docs/'):
-                    os.mkdir('./docs/')
-
-                # list to store all the chunks
-                all_chunks = []
-                
-                for uploaded_file in uploaded_files:
-
-                    # writing the file from RAM to the current directory on disk
-                    bytes_data = uploaded_file.read()
-                    file_name = os.path.join('./docs/', uploaded_file.name)
-                    with open(file_name, 'wb') as f:
-                        f.write(bytes_data)
-
-                    data = load_document(file_name)
-                    chunks = chunk_data(data, chunk_size=chunk_size)
-                    st.write(f'File name: {os.path.basename(file_name)}, Chunk size: {chunk_size}, Chunks: {len(chunks)}')
-                    all_chunks.extend(chunks)
-
-                tokens, embedding_cost = calculate_embedding_cost(all_chunks)
-                st.write(f'Embedding cost: ${embedding_cost:.4f}')
-
-                # creating the embeddings and returning the Chroma vector store
-                vector_store = create_embeddings(all_chunks)
-
-                # saving the vector store in the streamlit session state (to be persistent between reruns)
-                st.session_state.vs = vector_store
-                st.success('Uploaded, chunked and embedded successfully.')
-
-                # deleting files from the docs folder after they have been chunked and embedded
-                for file in os.listdir('./docs/'):
-                    os.remove(os.path.join('./docs/', file))
-
-                # deleting the docs folder
-                os.rmdir('./docs/')
-
-    if uploaded_files and 'vs' in st.session_state: #and is_api_key_valid(api_key):
-
-        # user's question text input widget
-        q = st.text_input('Ask one or more questions about the content of the uploaded data:', key='text_input')
-        if q: # if the user entered a question and hit enter
-            if 'vs' in st.session_state: # if vector store exists in the session state
-                vector_store = st.session_state.vs
-                answer = ask_and_get_answer(vector_store, q, k)
-
-                # text area widget for the LLM answer with flexible height
-                st.text_area('LLM Answer: ', value=answer, height=200)
-
-
-        # Button for new question, on click clear text input
-        if st.session_state.text_input:
-            st.button('New question for same context', on_click=clear_text_input, key='new_question_same_context')
-            st.button('New question for new context', on_click=start_over_with_new_document, key='new_question_new_context')
-
-    else:
-        st.info('Please upload one or more files to continue.')
-
-    # insert divider
-    st.markdown('---')
-
-    # insert subtitle
-    st.subheader('How it works')
-    st.markdown('''
-                The application is using [OpenAI's gpt-4o-mini model](https://openai.com/index/gpt-4o-mini-advancing-cost-efficient-intelligence/) to answer questions about the content of one or more files that contain text.
-                Uploaded files are chunked into smaller pieces and each piece is embedded using the [LangChain](https://python.langchain.com/docs/get_started/introduction.html) OpenAIEmbeddings() class.
-                The embeddings are temporarily saved in a [Chroma](https://python.langchain.com/docs/modules/data_connection/vectorstores/integrations/chroma) vector store.
-                The user can then ask questions about the content of the data and the application will return an answer. You will need a valid [OpenAI API key](https://help.openai.com/en/articles/4936850-where-do-i-find-my-secret-api-key) to use this application.
-                Using the OpenAI API is not free and you will be charged for the number of tokens used. The application will show you the number of tokens used and the approximate cost of the embeddings as of September 2024.
-                ''')
-    
-    st.subheader('Gotchas')
-    st.markdown('''
-                This is an experimental proof of concept (POC) application and [the results are not guaranteed to be accurate and could be misleading or even wrong](https://becominghuman.ai/why-large-language-models-like-chatgpt-are-bullshit-artists-c4d5bb850852).
-                You can and should never blindly trust the answers given by [Large Language Models (LLMs)](https://en.wikipedia.org/wiki/Large_language_model). Always verify the answers yourself.
-                ''')
-    
-
-            
-                
-
-
+    main()
