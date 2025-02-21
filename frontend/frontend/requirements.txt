@@ -1,24 +1,21 @@
-# Core dependencies
+# Core application dependencies
 streamlit==1.31.0
 openai==1.63.2
 python-dotenv==1.0.1
+
+# Database dependencies
+sqlmodel==0.0.22
+pgvector==0.3.6
+psycopg2-binary==2.9.9
+
+# Document processing
 langchain==0.3.19
 langchain-community==0.3.18
 langchain-text-splitters==0.3.6
-sqlmodel==0.0.22
-pgvector==0.3.6
-alembic==1.14.1
-pydantic==2.10.6
-tiktoken==0.8.0
-
-# Document processing
-unstructured[pdf]==0.16.23
+unstructured==0.16.23
 docx2txt==0.8
 pypdf==5.3.0
+tiktoken==0.8.0
 
-# Database and file handling
-psycopg2==2.9.10
-python-multipart==0.0.20
-
-# Your database package from GitHub
+# Custom database package
 git+https://github.com/mustafayasin/sourcehub.git#subdirectory=database
