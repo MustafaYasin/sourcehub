@@ -3,10 +3,10 @@ streamlit==1.31.0
 openai==1.63.2
 python-dotenv==1.0.1
 
-# Database dependencies
+# Database dependencies - Note the change to psycopg2-binary
 sqlmodel==0.0.22
 pgvector==0.3.6
-psycopg2-binary==2.9.9
+psycopg2-binary==2.9.9  # This is the key change - using the pre-compiled binary version
 
 # Document processing
 langchain==0.3.19
@@ -17,5 +17,5 @@ docx2txt==0.8
 pypdf==5.3.0
 tiktoken==0.8.0
 
-# Custom database package
+# Your database package - this should come last to ensure all dependencies are installed first
 git+https://github.com/mustafayasin/sourcehub.git#subdirectory=database
