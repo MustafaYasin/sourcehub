@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 from typing import Any, Sequence
+from dotenv import load_dotenv
 
 import streamlit as st
 from openai import AsyncOpenAI, OpenAI
@@ -10,6 +11,10 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 import tiktoken
 import uuid
 from sqlalchemy import func
+
+
+# Load environment variables from root directory
+load_dotenv(Path(__file__).parent.parent.parent / '.env')
 
 from database import open_session
 from database.models import Chunk
@@ -165,32 +170,27 @@ def create_embedding(text: str, client: OpenAI) -> list[float]:
     return response.data[0].embedding
 
 
-def clean_database() -> None:
-    """Clean database by removing duplicate entries based on content and title."""
+def clear_database() -> None:
+
     with open_session() as session:
-        # First, let's get all chunks
-        all_chunks = session.exec(select(Chunk)).all()
+        try:
+            # First get all chunks
+            chunks = session.exec(select(Chunk)).all()
 
-        # Create a set to track unique content
-        seen_content = set()
-        chunks_to_delete = []
+            # Delete each chunk using the session
+            for chunk in chunks:
+                session.delete(chunk)
 
-        for chunk in all_chunks:
-            # Create a unique identifier for each chunk based on content and title
-            content_key = (chunk.chunk_content, chunk.chunk_title)
+            # Commit the changes
+            session.commit()
 
-            if content_key in seen_content:
-                chunks_to_delete.append(chunk)
-            else:
-                seen_content.add(content_key)
+            # Show success message with count of deleted entries
+            st.success(f'Successfully cleared {len(chunks)} entries from the database')
 
-        # Delete duplicate chunks
-        for chunk in chunks_to_delete:
-            session.delete(chunk)
-
-        session.commit()
-
-        st.success(f"Cleaned database: Removed {len(chunks_to_delete)} duplicate chunks")
+        except Exception as e:
+            # If anything goes wrong, rollback the changes
+            session.rollback()
+            st.error(f'Error clearing database: {str(e)}')
 
 
 def find_relevant_chunks(
@@ -198,33 +198,16 @@ def find_relevant_chunks(
         client: OpenAI,
         k: int = 3
 ) -> Sequence[Chunk]:
-    """Find the k most relevant chunks using semantic similarity via embeddings.
-
-    This function converts the query into an embedding vector and finds the most
-    semantically similar chunks in the database, regardless of exact word matches.
-    This allows for natural language understanding where different words with
-    similar meanings can match, and context is taken into account.
-    """
+    """Find the k most relevant chunks using semantic similarity via embeddings."""
     query_embedding = create_embedding(query, client)
 
     with open_session() as session:
-        # Use pure vector similarity search without any text matching
         chunks = session.exec(
             select(Chunk)
             .where(Chunk.is_embedded == True)  # noqa: E712
             .order_by(Chunk.embedding.l2_distance(query_embedding))
             .limit(k)
         ).all()
-
-        # Debug information to understand what chunks were found
-        st.write(f"\nFound {len(chunks)} semantically relevant chunks")
-
-        for i, chunk in enumerate(chunks):
-            st.write(f"\nChunk {i + 1}:")
-            st.write(f"Title: {chunk.chunk_title}")
-            st.write(f"Page: {chunk.page_number + 1}")
-            st.write("Content:")
-            st.write(chunk.chunk_content)
 
         return chunks
 
@@ -234,20 +217,13 @@ def generate_answer(
         client: OpenAI,
         k: int = 3
 ) -> str:
-    """Generate an answer for a query using relevant chunks and GPT-4.
-
-    This function takes chunks found through embedding similarity search and uses
-    GPT-4 to generate a coherent answer based on their content. It's specifically
-    optimized for German technical documentation and ensures proper context
-    understanding and source attribution.
-    """
+    """Generate an answer for a query using relevant chunks and GPT-4."""
     try:
         relevant_chunks = find_relevant_chunks(query, client, k)
 
         if not relevant_chunks:
             return "Es wurden keine relevanten Informationen in den Dokumenten gefunden."
 
-        # Format context with clear section separation and source attribution
         context = "\n\n".join(
             f"""=== Dokumentenauszug ===
 Quelle: {chunk.chunk_title}
@@ -259,7 +235,6 @@ Seite: {chunk.page_number + 1}
             for chunk in relevant_chunks
         )
 
-        # Create a structured prompt that emphasizes using the provided content
         messages = [
             {
                 "role": "system",
@@ -292,7 +267,6 @@ Anforderungen an die Antwort:
             }
         ]
 
-        # Get response from GPT-4 with temperature 0 for maximum precision
         response = client.chat.completions.create(
             model=OPENAI_CHAT_MODEL,
             messages=messages,
@@ -343,60 +317,61 @@ def process_documents(
     try:
         all_chunks = []
         for uploaded_file in uploaded_files:
-            # Save file temporarily
             temp_path = temp_dir / uploaded_file.name
             temp_path.write_bytes(uploaded_file.read())
 
-            # Process document
             with st.spinner(f'Processing {uploaded_file.name}...'):
                 documents = load_document(temp_path)
                 chunks = create_chunks(documents, chunk_size, chunk_overlap)
                 all_chunks.extend(chunks)
-                st.sidebar.write(f'Processed: {uploaded_file.name} ({len(chunks)} chunks)')
 
         if not all_chunks:
             st.warning("No content was extracted from the documents.")
             return
 
-        # Calculate and display embedding cost
         tokens, cost = calculate_embedding_cost(all_chunks)
-        st.sidebar.write(f'Embedding cost: ${cost:.4f} ({tokens:,} tokens)')
+        st.sidebar.write(f'Estimated cost: ${cost:.4f}')
 
-        # Create embeddings and store in database
-        st.write("Creating embeddings...")
-        processed_count = create_embeddings(client, all_chunks)
-
-        if processed_count > 0:
-            st.success(f'Successfully created {processed_count} embeddings')
-        else:
-            st.info('No new embeddings needed to be created')
+        with st.spinner('Creating embeddings...'):
+            processed_count = create_embeddings(client, all_chunks)
+            if processed_count > 0:
+                st.success(f'Processed {processed_count} chunks')
 
     except Exception as e:
-        st.error(f"Error during document processing: {str(e)}")
+        st.error(f"Error during processing: {str(e)}")
 
     finally:
-        # Cleanup temporary files
         for file in temp_dir.iterdir():
             file.unlink()
         temp_dir.rmdir()
 
 
+
+
 def main() -> None:
     """Main application entry point."""
-    # Initialize Streamlit page
     st.set_page_config(
-        page_title="Document Q&A System",
-        page_icon="📚",
+        page_title="Pixida Chat",
+        page_icon="🌐",
         layout="wide"
     )
-    st.header("Document Question-Answering System")
+    from authenticate import authenticate
+    authenticate()
 
-    # Initialize session state
     if 'text_input' not in st.session_state:
         st.session_state.text_input = ''
 
-    # Setup sidebar
     with st.sidebar:
+        # Add the logo first, so it appears at the top
+        st.image(
+            "images/icon.svg",  # Adjust this path to match your logo's location
+            width=150  # Adjust the width to fit your sidebar nicely
+        )
+
+        # Add some space between the logo and the API key input
+        #st.write("")  # This creates a small vertical gap
+
+        # Now add the API key input and other sidebar elements
         api_key = st.text_input('OpenAI API Key:', type='password')
         if api_key:
             os.environ['OPENAI_API_KEY'] = api_key
@@ -408,15 +383,16 @@ def main() -> None:
             'Upload documents to analyze:',
             accept_multiple_files=True
         )
-        if st.button("Clean Database"):
-            clean_database()
+
+        if st.button("Clear Database"):
+            clear_database()
 
         chunk_size = st.number_input(
             'Chunk size:',
             min_value=100,
             max_value=8192,
             value=512,
-            help="Number of characters per chunk. Larger chunks provide more context but cost more to embed."
+            help="Characters per chunk (affects context size)"
         )
 
         chunk_overlap = st.number_input(
@@ -424,54 +400,34 @@ def main() -> None:
             min_value=0,
             max_value=chunk_size // 2,
             value=20,
-            help="Number of characters that overlap between chunks to maintain context."
+            help="Overlap between chunks"
         )
 
         k = st.number_input(
-            'Number of relevant chunks:',
+            'Relevant chunks:',
             min_value=1,
             max_value=20,
             value=3,
-            help="Number of most relevant chunks to use when answering questions."
+            help="Number of chunks to consider"
         )
 
-    # Handle document processing
     if uploaded_files and st.sidebar.button('Process Documents'):
         if not client:
             st.sidebar.error('Please provide your OpenAI API key.')
             st.stop()
+        process_documents(uploaded_files, chunk_size, chunk_overlap, client)
 
-        with st.spinner('Processing documents...'):
-            process_documents(uploaded_files, chunk_size, chunk_overlap, client)
-
-    # Setup query interface
     query = st.text_input('Ask a question about your documents:', key='text_input')
 
-    # In your main function where you handle questions
     if query:
         if not client:
-            st.error('Please provide your OpenAI API key to ask questions.')
+            st.error('Please provide your OpenAI API key.')
             st.stop()
 
         with st.spinner('Finding answer...'):
-            # Add debug information
-            st.write("Verifying content in database:")
-            verify_content_exists("Zur Anwendung dieses Kommentars")
-
-            # Get the answer
             answer = generate_answer(query, client, k)
             st.text_area('Answer:', value=answer, height=200)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            # In your main processing logic
-            if st.button("Process any pending embeddings"):
-                with st.spinner("Processing pending embeddings..."):
-                    processed = process_pending_embeddings(client)
-                    if processed > 0:
-                        st.success(f"Processed {processed} pending embeddings")
-                    else:
-                        st.info("No pending embeddings to process")
     else:
         st.info('Upload documents and ask questions to get started.')
 
@@ -482,9 +438,9 @@ def main() -> None:
     This document Q&A system uses advanced natural language processing to help you interact with your documents:
 
     1. Documents are split into manageable chunks and stored in a PostgreSQL database
-    2. Each chunk is embedded using OpenAI's text-embedding-3-small model
+    2. Each chunk is embedded using OpenAI's text-embedding model
     3. Questions are matched to relevant document chunks using vector similarity
-    4. GPT-4 generates answers based on the most relevant chunks
+    4. GPT generates answers based on the most relevant chunks
 
     The system uses pgvector for efficient similarity search and can handle multiple document formats.
     """)
